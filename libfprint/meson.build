@@ -122,6 +122,12 @@ driver_sources = {
     'elan' : files('drivers/elan.c'),
     'elanmoc' : files('drivers/elanmoc/elanmoc.c'),
     'elanspi' : files('drivers/elanspi.c'),
+    'goodixtls' : files(
+        'drivers/goodixtls/goodixtls.c',
+        'drivers/goodixtls/goodix_sift.c',
+        'drivers/goodixtls/goodix_tls.c',
+        'drivers/goodixtls/config_pcap.c',
+    ),
     'nb1010' : files('drivers/nb1010.c'),
     'virtual_image' : files('drivers/virtual-image.c'),
     'virtual_device' : files('drivers/virtual-device.c'),
