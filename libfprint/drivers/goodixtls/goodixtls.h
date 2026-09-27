@@ -2,8 +2,12 @@
  * Goodix GXFP5187 SPI (TLS-PSK) driver for libfprint
  *
  * Copyright (C) 2026 Benjamin Allègre (https://github.com/Sigfrodr)
+ * Copyright (C) 2026 Marios Andreopoulos <opensource@andmarios.com>
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ * Modified in September 2026 by Marios Andreopoulos: unused command
+ * definitions removed.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -33,21 +37,11 @@
 #define GOODIX_PKT_PLAIN   0xA0
 #define GOODIX_PKT_TLS     0xB0
 
-/*
- * Command table. The first body byte is (cmd0 << 4) | (cmd1 << 1), with
- * cmd0 being: 0x2 image, 0x3 finger detect, 0x5 navigation, 0x8 register,
- * 0x9 chip, 0xA MCU, 0xD TLS connection, 0xF firmware update / memory.
- */
-#define GOODIX_CMD_IMAGE       0x20
-#define GOODIX_CMD_FDT_DOWN    0x36
-#define GOODIX_CMD_NAV         0x50
-#define GOODIX_CMD_REG         0x82
-#define GOODIX_CMD_ENABLE_CHIP 0x96
-#define GOODIX_CMD_MCU_STATE   0xAE
+/* Command bytes used at run time. A command byte is (cmd0 << 4) | (cmd1 << 1),
+ * cmd0 being the group: 0x2 image, 0x3 finger detect, 0x5 navigation,
+ * 0x8 register, 0x9 chip, 0xA MCU, 0xD TLS connection, 0xF memory. */
 #define GOODIX_CMD_UPLOAD_CFG  0x90
-#define GOODIX_CMD_REQUEST_TLS 0xD0
-#define GOODIX_CMD_TLS_OK      0xD4
-#define GOODIX_CMD_FW_VERSION  0xA8
+#define GOODIX_CMD_MCU_STATE   0xAE
 #define GOODIX_CMD_MEM_READ    0xF2   /* arbitrary memory read: [addr32][len32] */
 
 /*

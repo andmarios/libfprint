@@ -2,8 +2,13 @@
  * Local descriptor extraction and matching for fingerprint images
  *
  * Copyright (C) 2026 Benjamin Allègre (https://github.com/Sigfrodr)
+ * Copyright (C) 2026 Marios Andreopoulos <opensource@andmarios.com>
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ * Modified in September 2026 by Marios Andreopoulos: rigid (rotation and
+ * translation) geometric check for verification, one-to-one candidate pairs,
+ * integer descriptor distances, unused matching code removed.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -20,21 +25,14 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#define _USE_MATH_DEFINES
-#define _GNU_SOURCE
-
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "goodix_sift.h"
 
-#ifndef RATIO
 #define RATIO       0.90        /* Lowe's ratio test */
-#endif
-#ifndef GEO_TOL
 #define GEO_TOL     6.0         /* geometric consistency tolerance, in pixels */
-#endif
 #define MIN_PAIRS   3
 
 /* ------------------------------------------------------------------ */
@@ -238,25 +236,82 @@ gx_sift_free (GxSiftFeatures *f)
 /*  Matching                                                           */
 /* ------------------------------------------------------------------ */
 
-static double
+/* Squared distance between two descriptors. They are bytes, so the result is
+ * an exact integer (at most 128 * 255^2, well within 32 bits): computing it in
+ * integers gives the same matches as doubles, about ten times faster — this
+ * loop is nearly all of the matching time. */
+static guint32
 desc_dist2 (const guint8 *a, const guint8 *b)
 {
-  double s = 0;
+  guint32 s = 0;
   int i;
 
   for (i = 0; i < GX_SIFT_DIM; i++)
     {
-      double d = (double) a[i] - b[i];
-      s += d * d;
+      int d = (int) a[i] - b[i];
+      s += (guint32) (d * d);
     }
   return s;
 }
 
-int
-gx_sift_match_xform (const GxSiftFeatures *A, const GxSiftFeatures *B,
-                     guint8 *mask, int *out_tx, int *out_ty)
+/* Nearest-neighbour matching with Lowe's ratio test: fills pi/pj (each sized
+ * A->n) with candidate pairs and returns their number.
+ *
+ * The pairs are one-to-one: when several points of A pick the same point of
+ * B, only the closest is kept. Otherwise a cluster of "N consistent pairs"
+ * could rest on fewer than N distinct points of the capture, and the minimum
+ * cluster size would not mean what it says.
+ *
+ * (Full mutual-consistency filtering — each pair being the other's nearest
+ * neighbour both ways — was tried and rejected: it drops genuine scores from
+ * 16 to 12 while impostor scores stay put.) */
+static int
+ratio_pairs (const GxSiftFeatures *A, const GxSiftFeatures *B, int *pi, int *pj)
 {
-  int i, j, np = 0, best = 0;
+  g_autofree guint32 *best_d = g_new (guint32, B->n);
+  g_autofree int *best_i = g_new (int, B->n);
+  int i, j, np = 0;
+
+  for (j = 0; j < (int) B->n; j++)
+    {
+      best_d[j] = G_MAXUINT32;
+      best_i[j] = -1;
+    }
+  for (i = 0; i < (int) A->n; i++)
+    {
+      guint32 d1 = G_MAXUINT32, d2 = G_MAXUINT32;
+      int jb = -1;
+
+      for (j = 0; j < (int) B->n; j++)
+        {
+          guint32 d = desc_dist2 (A->pts[i].desc, B->pts[j].desc);
+          if (d < d1) { d2 = d1; d1 = d; jb = j; }
+          else if (d < d2) d2 = d;
+        }
+      if (jb >= 0 && (double) d1 < RATIO * RATIO * (double) d2 && d1 < best_d[jb])
+        {
+          best_d[jb] = d1;
+          best_i[jb] = i;
+        }
+    }
+  for (j = 0; j < (int) B->n; j++)
+    if (best_i[j] >= 0)
+      {
+        pi[np] = best_i[j];
+        pj[np] = j;
+        np++;
+      }
+  return np;
+}
+
+/* Translation-only vote, used to register enrolment views against each other
+ * (verification uses the rigid check in gx_sift_match_mask). Returns the size of the best cluster
+ * and its translation. */
+static int
+match_translation (const GxSiftFeatures *A, const GxSiftFeatures *B,
+                   int *out_tx, int *out_ty)
+{
+  int i, j, np, best = 0;
   double bt_x = 0, bt_y = 0;
   g_autofree int *pi = NULL, *pj = NULL;
 
@@ -264,26 +319,7 @@ gx_sift_match_xform (const GxSiftFeatures *A, const GxSiftFeatures *B,
     return 0;
   pi = g_new (int, A->n);
   pj = g_new (int, A->n);
-
-  /* Nearest-neighbour matching with Lowe's ratio test.
-   *
-   * Mutual-consistency filtering (keeping only pairs that are each other's
-   * nearest neighbour) was tried and rejected: measured on recorded sets it
-   * drops genuine scores from 16 to 12 while impostor scores stay put. */
-  for (i = 0; i < (int) A->n; i++)
-    {
-      double d1 = 1e300, d2 = 1e300;
-      int jb = -1;
-
-      for (j = 0; j < (int) B->n; j++)
-        {
-          double d = desc_dist2 (A->pts[i].desc, B->pts[j].desc);
-          if (d < d1) { d2 = d1; d1 = d; jb = j; }
-          else if (d < d2) d2 = d;
-        }
-      if (jb >= 0 && d1 < RATIO * RATIO * d2)
-        { pi[np] = i; pj[np] = jb; np++; }
-    }
+  np = ratio_pairs (A, B, pi, pj);
   if (np < MIN_PAIRS)
     return 0;
 
@@ -307,34 +343,101 @@ gx_sift_match_xform (const GxSiftFeatures *A, const GxSiftFeatures *B,
         { best = cnt; bt_x = tx; bt_y = ty; }
     }
 
-  if (out_tx) *out_tx = (int) bt_x;
-  if (out_ty) *out_ty = (int) bt_y;
-
-  /* Flag the points of B belonging to the best cluster, so the caller can
-   * merge evidence across several template views. */
-  if (mask && best >= MIN_PAIRS)
-    for (j = 0; j < np; j++)
-      {
-        double ex = B->pts[pj[j]].x - A->pts[pi[j]].x - bt_x;
-        double ey = B->pts[pj[j]].y - A->pts[pi[j]].y - bt_y;
-        if (ex * ex + ey * ey <= GEO_TOL * GEO_TOL)
-          mask[pj[j]] = 1;
-      }
+  *out_tx = (int) bt_x;
+  *out_ty = (int) bt_y;
   return best;
 }
+
+/* Rigid geometric validation for verification: rotation + translation.
+ *
+ * The translation-only vote above breaks as soon as the finger lands a few
+ * degrees rotated: 6 px of tolerance is exceeded ~50 px from the pivot at
+ * about 7 degrees, so genuine points scatter out of the cluster. Here every
+ * pair of candidate matches whose two segments have the same length proposes
+ * a rotation and a translation, and the hypothesis explaining most pairs wins.
+ *
+ * Measured on 58 labelled captures from a second unit (GXFP5187, a real
+ * 30-view enrolment), threshold 12 versus the translation vote at 15:
+ *   naturally shifted presses  11/20 accepted, was  6/20
+ *   normal presses             10/10,          was 10/10
+ *   16 other fingers           max score 4,    was max 6
+ * i.e. better on both sides; with one-to-one pairs (see ratio_pairs) the
+ * impostors all scored 0 and the genuine acceptance stayed the same. The two restrictions carry the impostor side:
+ * rotation is bounded (a wider bound lifted impostors to 12-14 for almost no
+ * gain on strongly rotated presses — those fail because that area was never
+ * enrolled, not because of the geometry), and a view only contributes from
+ * RIGID_MIN_PAIRS consistent pairs, since chance alignments between two
+ * different fingers rarely reach four rigidly consistent, distinct points. */
+#define RIGID_MAX_ROT   (20.0 * M_PI / 180.0)
+#define RIGID_MIN_LEN   12.0   /* px: shorter segments give a noisy angle */
+#define RIGID_LEN_TOL   4.0    /* px: the two segments must be equally long */
+#define RIGID_MIN_PAIRS 4
 
 int
 gx_sift_match_mask (const GxSiftFeatures *A, const GxSiftFeatures *B,
                     guint8 *mask)
 {
-  return gx_sift_match_xform (A, B, mask, NULL, NULL);
+  int i, j, k, np, best = 0;
+  double bc = 1, bs = 0, btx = 0, bty = 0;
+  g_autofree int *pi = NULL, *pj = NULL;
+
+  if (!A || !B || A->n < RIGID_MIN_PAIRS || B->n < RIGID_MIN_PAIRS)
+    return 0;
+  pi = g_new (int, A->n);
+  pj = g_new (int, A->n);
+  np = ratio_pairs (A, B, pi, pj);
+  if (np < RIGID_MIN_PAIRS)
+    return 0;
+
+  for (i = 0; i < np; i++)
+    for (j = i + 1; j < np; j++)
+      {
+        const GxSiftPoint *a1 = &A->pts[pi[i]], *a2 = &A->pts[pi[j]];
+        const GxSiftPoint *b1 = &B->pts[pj[i]], *b2 = &B->pts[pj[j]];
+        double ax = a2->x - a1->x, ay = a2->y - a1->y;
+        double bx = b2->x - b1->x, by = b2->y - b1->y;
+        double la = hypot (ax, ay), lb = hypot (bx, by);
+        double th, c, s, tx, ty;
+        int cnt = 0;
+
+        if (la < RIGID_MIN_LEN || fabs (la - lb) > RIGID_LEN_TOL)
+          continue;
+        th = atan2 (by, bx) - atan2 (ay, ax);
+        if (th > M_PI) th -= 2 * M_PI;
+        if (th < -M_PI) th += 2 * M_PI;
+        if (fabs (th) > RIGID_MAX_ROT)
+          continue;
+        c = cos (th);
+        s = sin (th);
+        /* Translation that maps the midpoint of the A segment onto that of
+         * the B segment: less sensitive to either endpoint's jitter. */
+        tx = (b1->x + b2->x) / 2.0 - (c * (a1->x + a2->x) - s * (a1->y + a2->y)) / 2.0;
+        ty = (b1->y + b2->y) / 2.0 - (s * (a1->x + a2->x) + c * (a1->y + a2->y)) / 2.0;
+
+        for (k = 0; k < np; k++)
+          {
+            double ex = c * A->pts[pi[k]].x - s * A->pts[pi[k]].y + tx - B->pts[pj[k]].x;
+            double ey = s * A->pts[pi[k]].x + c * A->pts[pi[k]].y + ty - B->pts[pj[k]].y;
+            if (ex * ex + ey * ey <= GEO_TOL * GEO_TOL)
+              cnt++;
+          }
+        if (cnt > best)
+          { best = cnt; bc = c; bs = s; btx = tx; bty = ty; }
+      }
+
+  if (best < RIGID_MIN_PAIRS)
+    return 0;
+  if (mask)
+    for (k = 0; k < np; k++)
+      {
+        double ex = bc * A->pts[pi[k]].x - bs * A->pts[pi[k]].y + btx - B->pts[pj[k]].x;
+        double ey = bs * A->pts[pi[k]].x + bc * A->pts[pi[k]].y + bty - B->pts[pj[k]].y;
+        if (ex * ex + ey * ey <= GEO_TOL * GEO_TOL)
+          mask[pj[k]] = 1;
+      }
+  return best;
 }
 
-int
-gx_sift_match (const GxSiftFeatures *A, const GxSiftFeatures *B)
-{
-  return gx_sift_match_xform (A, B, NULL, NULL, NULL);
-}
 
 /* ------------------------------------------------------------------ */
 /*  Serialisation                                                      */
@@ -403,7 +506,6 @@ struct _GxSiftIsland
 {
   GArray  *pts;                   /* GxSiftPoint, in the island's frame */
   int      x0, y0, x1, y1;        /* current extent */
-  gboolean empty;
 };
 
 /* Merges @src, offset by (tx, ty), into @dst, dropping points that duplicate
@@ -443,7 +545,6 @@ gx_sift_island_new (void)
   GxSiftIsland *i = g_new0 (GxSiftIsland, 1);
 
   i->pts = g_array_new (FALSE, FALSE, sizeof (GxSiftPoint));
-  i->empty = TRUE;
   return i;
 }
 
@@ -483,10 +584,9 @@ gx_sift_island_add (GxSiftIsland *isl, const GxSiftFeatures *v,
   if (!isl || !v || !v->n)
     return FALSE;
 
-  if (isl->empty)
+  if (isl->pts->len == 0)
     {
       merge_points (isl->pts, v, 0, 0);
-      isl->empty = FALSE;
       island_bounds (isl);
       if (out_dx) *out_dx = 0;
       if (out_dy) *out_dy = 0;
@@ -496,7 +596,7 @@ gx_sift_island_add (GxSiftIsland *isl, const GxSiftFeatures *v,
 
   cur.n = isl->pts->len;
   cur.pts = (GxSiftPoint *) isl->pts->data;
-  sc = gx_sift_match_xform (&cur, v, NULL, &tx, &ty);
+  sc = match_translation (&cur, v, &tx, &ty);
   if (out_score) *out_score = sc;
   if (sc < MERGE_MIN_PAIRS)
     return FALSE;                 /* no usable overlap */

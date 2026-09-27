@@ -2,8 +2,11 @@
  * Sensor configuration blob, as observed on the wire
  *
  * Copyright (C) 2026 Benjamin Allègre (https://github.com/Sigfrodr)
+ * Copyright (C) 2026 Marios Andreopoulos <opensource@andmarios.com>
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ * Modified in September 2026 by Marios Andreopoulos: comment translated.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -20,7 +23,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-/* Config capteur (trame 19 du pcap wireshark-goodix) — ouvre le gate. */
+/* Sensor configuration: frame 19 of a Wireshark capture of the Windows
+ * driver. Uploading it (command 0x90) opens the command gate. */
 #include <glib.h>
 
 const gsize CONFIG_PCAP_LEN = 256;

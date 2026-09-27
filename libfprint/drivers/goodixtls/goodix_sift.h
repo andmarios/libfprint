@@ -2,8 +2,11 @@
  * Local descriptor extraction and matching for fingerprint images
  *
  * Copyright (C) 2026 Benjamin Allègre (https://github.com/Sigfrodr)
+ * Copyright (C) 2026 Marios Andreopoulos <opensource@andmarios.com>
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ * Modified in September 2026 by Marios Andreopoulos (see goodix_sift.c).
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -45,17 +48,13 @@
 #define GX_SIFT_BINS    8
 #define GX_SIFT_DIM     (GX_SIFT_CELLS * GX_SIFT_CELLS * GX_SIFT_BINS)  /* 128 */
 
-#ifndef GX_SIFT_PATCH
 #define GX_SIFT_PATCH   20      /* descriptor window side, in pixels */
-#endif
 
-#ifndef GX_SIFT_MAX_PTS
 /* Keypoints kept per image. Measured on recorded capture sets: raising this
  * from 60 to 150 lifts the genuine score from 6.5 to 11.7 matches on average
  * without lifting an impostor's. Beyond 150 the detector saturates: a 132x112
  * image simply holds no more salient points. */
 #define GX_SIFT_MAX_PTS 150
-#endif
 
 /* 8-bit quantised descriptor: compact, and precise enough for matching. */
 typedef struct
@@ -76,21 +75,13 @@ GxSiftFeatures *gx_sift_extract (const double *img, int w, int h);
 
 void gx_sift_free (GxSiftFeatures *f);
 
-/* Number of geometrically consistent matches between two feature sets. This is
- * the similarity score: above a threshold, both come from the same finger. */
-int gx_sift_match (const GxSiftFeatures *a, const GxSiftFeatures *b);
-
-/* Same, but also flags in @mask (sized b->n) the points of @b that matched
- * consistently. Lets the caller accumulate evidence across several template
- * views instead of keeping only the best view's score. */
+/* Matches template view @a against capture @b with a rigid geometric check
+ * (rotation + translation), returns the size of the consistent cluster, and
+ * flags in @mask (sized b->n) the points of @b belonging to it. The mask lets
+ * the caller accumulate evidence across several template views instead of
+ * keeping only the best view's score. */
 int gx_sift_match_mask (const GxSiftFeatures *a, const GxSiftFeatures *b,
                         guint8 *mask);
-
-/* Same, and also reports the (b - a) translation of the best consistent
- * cluster. This is what allows template views to be registered into a common
- * frame. */
-int gx_sift_match_xform (const GxSiftFeatures *a, const GxSiftFeatures *b,
-                         guint8 *mask, int *out_tx, int *out_ty);
 
 /*
  * Incremental registration, used to guide enrolment in real time.

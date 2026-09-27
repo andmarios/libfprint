@@ -2,8 +2,13 @@
  * TLS-PSK channel for the Goodix GXFP5187 sensor
  *
  * Copyright (C) 2026 Benjamin Allègre (https://github.com/Sigfrodr)
+ * Copyright (C) 2026 Marios Andreopoulos <opensource@andmarios.com>
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ * Modified in September 2026 by Marios Andreopoulos: key derivation through
+ * OpenSSL's TLS1-PRF KDF, a single BIO method per process, only the key
+ * material in use is kept.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -22,11 +27,13 @@
 
 #include <string.h>
 
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#include <openssl/hmac.h>
-#include <openssl/evp.h>
 #include <openssl/bio.h>
+#include <openssl/core_names.h>
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/kdf.h>
+#include <openssl/ssl.h>
 
 #include "goodix_tls.h"
 
@@ -41,7 +48,6 @@ struct _GxTls
 {
   SSL_CTX   *ctx;
   SSL       *ssl;
-  BIO_METHOD *biom;
 
   GxTlsSend  send;
   GxTlsRecv  recv;
@@ -52,11 +58,10 @@ struct _GxTls
   gchar     *identity;
 
   /* Derived once the handshake completes. The sensor is the client, so its
-   * records are protected with the client_write_* material. */
+   * records are protected with the client_write_* material; our own records
+   * go through OpenSSL, which keeps the server_write_* half. */
   guint8     client_mac[MAC_KEY_LEN];
   guint8     client_key[ENC_KEY_LEN];
-  guint8     server_mac[MAC_KEY_LEN];
-  guint8     server_key[ENC_KEY_LEN];
   guint64    read_seq;
   gboolean   keys_ready;
 };
@@ -98,55 +103,63 @@ bio_create_cb (BIO *b)
   return 1;
 }
 
+/* The BIO method is created once per process: each BIO_get_new_index() call
+ * consumes one of only 127 custom BIO type numbers, and fprintd is a
+ * long-lived daemon that runs a handshake per operation. */
+static BIO_METHOD *
+bio_method (void)
+{
+  static gsize once = 0;
+  static BIO_METHOD *method;
+
+  if (g_once_init_enter (&once))
+    {
+      method = BIO_meth_new (BIO_get_new_index () | BIO_TYPE_SOURCE_SINK,
+                             "goodix-spi");
+      BIO_meth_set_write (method, bio_write_cb);
+      BIO_meth_set_read (method, bio_read_cb);
+      BIO_meth_set_ctrl (method, bio_ctrl_cb);
+      BIO_meth_set_create (method, bio_create_cb);
+      g_once_init_leave (&once, 1);
+    }
+  return method;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Key derivation (TLS 1.2 PRF with SHA-256)                          */
 /* ------------------------------------------------------------------ */
 
-/* P_hash from RFC 5246 section 5: A(0) = seed, A(i) = HMAC(secret, A(i-1)),
- * output = HMAC(secret, A(1) || seed) || HMAC(secret, A(2) || seed) || ... */
-static void
-tls_prf (const guint8 *secret, gsize secret_len,
-         const gchar *label, const guint8 *seed, gsize seed_len,
+/* TLS 1.2 PRF with SHA-256 (RFC 5246 section 5), from OpenSSL's KDF: the
+ * seed is the concatenation of the label and the two randoms. */
+static gboolean
+tls_prf (const guint8 *secret, gsize secret_len, const gchar *label,
+         const guint8 *seed1, gsize seed1_len,
+         const guint8 *seed2, gsize seed2_len,
          guint8 *out, gsize out_len)
 {
-  gsize label_len = strlen (label);
-  g_autofree guint8 *ls = g_malloc (label_len + seed_len);
-  guint8 a[EVP_MAX_MD_SIZE];
-  unsigned int a_len = 0;
-  gsize done = 0;
+  EVP_KDF *kdf = EVP_KDF_fetch (NULL, "TLS1-PRF", NULL);
+  EVP_KDF_CTX *kctx = kdf ? EVP_KDF_CTX_new (kdf) : NULL;
+  OSSL_PARAM params[] = {
+    OSSL_PARAM_construct_utf8_string (OSSL_KDF_PARAM_DIGEST, (char *) "SHA256", 0),
+    OSSL_PARAM_construct_octet_string (OSSL_KDF_PARAM_SECRET, (void *) secret, secret_len),
+    OSSL_PARAM_construct_octet_string (OSSL_KDF_PARAM_SEED, (void *) label, strlen (label)),
+    OSSL_PARAM_construct_octet_string (OSSL_KDF_PARAM_SEED, (void *) seed1, seed1_len),
+    OSSL_PARAM_construct_octet_string (OSSL_KDF_PARAM_SEED, (void *) seed2, seed2_len),
+    OSSL_PARAM_construct_end (),
+  };
+  gboolean ok = kctx && EVP_KDF_derive (kctx, out, out_len, params) > 0;
 
-  memcpy (ls, label, label_len);
-  memcpy (ls + label_len, seed, seed_len);
-
-  /* A(1) */
-  HMAC (EVP_sha256 (), secret, secret_len, ls, label_len + seed_len, a, &a_len);
-
-  while (done < out_len)
-    {
-      guint8 block[EVP_MAX_MD_SIZE];
-      unsigned int block_len = 0;
-      g_autofree guint8 *tmp = g_malloc (a_len + label_len + seed_len);
-      gsize take;
-
-      memcpy (tmp, a, a_len);
-      memcpy (tmp + a_len, ls, label_len + seed_len);
-      HMAC (EVP_sha256 (), secret, secret_len, tmp,
-            a_len + label_len + seed_len, block, &block_len);
-
-      take = MIN (block_len, out_len - done);
-      memcpy (out + done, block, take);
-      done += take;
-
-      /* A(i+1) = HMAC(secret, A(i)) */
-      HMAC (EVP_sha256 (), secret, secret_len, a, a_len, a, &a_len);
-    }
+  EVP_KDF_CTX_free (kctx);
+  EVP_KDF_free (kdf);
+  return ok;
 }
 
 static gboolean
 derive_keys (GxTls *t, GError **error)
 {
   SSL_SESSION *sess = SSL_get_session (t->ssl);
-  guint8 master[48], cr[32], sr[32], seed[64], kb[KEY_BLOCK_LEN];
+  guint8 master[48], cr[32], sr[32], kb[KEY_BLOCK_LEN];
+  gboolean ok;
   gsize n;
 
   if (!sess)
@@ -169,16 +182,19 @@ derive_keys (GxTls *t, GError **error)
     }
 
   /* key_block = PRF(master_secret, "key expansion",
-   *                 server_random + client_random)  — note the order. */
-  memcpy (seed, sr, 32);
-  memcpy (seed + 32, cr, 32);
-  tls_prf (master, sizeof master, "key expansion", seed, sizeof seed,
-           kb, sizeof kb);
-
+   *                 server_random + client_random)  — note the order.
+   * Layout: client MAC key, server MAC key, client key, server key. */
+  ok = tls_prf (master, sizeof master, "key expansion", sr, sizeof sr,
+                cr, sizeof cr, kb, sizeof kb);
+  OPENSSL_cleanse (master, sizeof master);
+  if (!ok)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED, "key derivation failed");
+      return FALSE;
+    }
   memcpy (t->client_mac, kb, MAC_KEY_LEN);
-  memcpy (t->server_mac, kb + MAC_KEY_LEN, MAC_KEY_LEN);
   memcpy (t->client_key, kb + 2 * MAC_KEY_LEN, ENC_KEY_LEN);
-  memcpy (t->server_key, kb + 2 * MAC_KEY_LEN + ENC_KEY_LEN, ENC_KEY_LEN);
+  OPENSSL_cleanse (kb, sizeof kb);
 
   /* Sequence numbers restart at zero when the cipher state changes, and the
    * Finished message is the first record under the new keys. Application data
@@ -186,9 +202,6 @@ derive_keys (GxTls *t, GError **error)
    * loudly if that assumption ever stops holding. */
   t->read_seq = 1;
   t->keys_ready = TRUE;
-
-  OPENSSL_cleanse (master, sizeof master);
-  OPENSSL_cleanse (kb, sizeof kb);
   return TRUE;
 }
 
@@ -263,14 +276,7 @@ gx_tls_handshake_run (GxTls *t, GError **error)
     }
   SSL_set_ex_data (t->ssl, 0, t);
 
-  t->biom = BIO_meth_new (BIO_get_new_index () | BIO_TYPE_SOURCE_SINK,
-                          "goodix-spi");
-  BIO_meth_set_write (t->biom, bio_write_cb);
-  BIO_meth_set_read (t->biom, bio_read_cb);
-  BIO_meth_set_ctrl (t->biom, bio_ctrl_cb);
-  BIO_meth_set_create (t->biom, bio_create_cb);
-
-  bio = BIO_new (t->biom);
+  bio = BIO_new (bio_method ());
   BIO_set_data (bio, t);
   SSL_set_bio (t->ssl, bio, bio);          /* SSL takes ownership */
 
@@ -400,8 +406,6 @@ gx_tls_free (GxTls *t)
     SSL_free (t->ssl);                      /* frees the BIO too */
   if (t->ctx)
     SSL_CTX_free (t->ctx);
-  if (t->biom)
-    BIO_meth_free (t->biom);
   OPENSSL_cleanse (t->psk, sizeof t->psk);
   OPENSSL_cleanse (t->client_key, sizeof t->client_key);
   OPENSSL_cleanse (t->client_mac, sizeof t->client_mac);
