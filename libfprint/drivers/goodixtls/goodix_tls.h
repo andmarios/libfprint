@@ -24,9 +24,9 @@
  */
 
 /*
- * The sensor speaks TLS 1.2 with TLS_PSK_WITH_AES_128_CBC_SHA256, and — with
- * the roles reversed from what one might expect — it is the CLIENT while the
- * host is the server.
+ * The sensor speaks TLS 1.2 with a plain-PSK suite (TLS_PSK_WITH_AES_128_CBC_SHA256
+ * on firmware GF3288_ST411SEC_APP_11033), and — with the roles reversed from
+ * what one might expect — it is the CLIENT while the host is the server.
  *
  * It also departs from the spec in one way that matters: it sends the whole
  * fingerprint image in a SINGLE record of about 22 kB, against the 16384-byte
@@ -70,6 +70,9 @@ gboolean gx_tls_handshake_run (GxTls *tls, GError **error);
 
 /* Name of the negotiated ciphersuite, for logging. */
 const gchar *gx_tls_ciphersuite (GxTls *tls);
+
+/* Version and suite IDs from the sensor's ClientHello, for logging. */
+const gchar *gx_tls_offered (GxTls *tls);
 
 /* Sends application data. Small commands only; goes through OpenSSL. */
 gboolean gx_tls_write (GxTls *tls, const guint8 *buf, gsize len);

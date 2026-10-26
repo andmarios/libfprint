@@ -826,7 +826,8 @@ gx_tls_handshake (FpiDeviceGoodixTls *self)
       fp_warn ("%s", err->message);
       return FALSE;
     }
-  fp_info ("TLS-PSK session up (%s)", gx_tls_ciphersuite (self->tls));
+  fp_info ("TLS-PSK session up (%s; sensor offered %s)",
+           gx_tls_ciphersuite (self->tls), gx_tls_offered (self->tls));
   self->tls_up = TRUE;
 
   g_usleep (GX_TLS_OK_SETTLE_US);
