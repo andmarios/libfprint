@@ -51,11 +51,19 @@
  * the in-application-programming mode that other approaches rely on — and it is
  * non-destructive, unlike rewriting the key through IAP.
  *
- * TLS identity is "Client_identity", ciphersuite TLS-PSK-WITH-AES-128-CBC-SHA256.
+ * TLS identity is "Client_identity". The suite is the sensor's choice and
+ * varies by firmware: GF3288_ST411SEC_APP_11033 offers
+ * TLS-PSK-WITH-AES-128-CBC-SHA256, APP_11034 offers the GCM variant.
  * Note the roles are reversed from what one might expect: the SENSOR is the TLS
  * client and the host is the server.
+ *
+ * The RAM address of the key also moved between firmware revisions. 11033 keeps
+ * it at 0x20007f0c; on 11034 the firmware's mbedTLS build points
+ * mbedtls_ssl_conf_psk() at 0x20012d68 instead (found by reversing the APP).
+ * The address is chosen at runtime from the firmware version string.
  */
-#define GOODIX_PSK_ADDR   0x20007f0c
+#define GOODIX_PSK_ADDR         0x20007f0c   /* GF3288_..._APP_11033 */
+#define GOODIX_PSK_ADDR_11034   0x20012d68   /* GF3288_..._APP_11034 */
 #define GOODIX_PSK_LEN    48
 #define GOODIX_TLS_IDENTITY "Client_identity"
 

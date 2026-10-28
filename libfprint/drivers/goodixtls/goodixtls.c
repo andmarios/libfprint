@@ -97,6 +97,22 @@
 
 #define GX_TLS_ATTEMPTS      3
 #define GX_PSK_ATTEMPTS      3
+#define GX_FW_ATTEMPTS       3
+
+/* What differs between the firmware revisions the driver knows, matched on the
+ * exact version string. The first entry is also the layout tried on a
+ * revision that is not listed: the only one the driver knew before 11034. */
+typedef struct
+{
+  const gchar *version;
+  guint32      psk_addr;
+  gboolean     psk_after_enable;  /* key only settled once the chip is enabled */
+} GxFirmware;
+
+static const GxFirmware gx_firmwares[] = {
+  { "GF3288_ST411SEC_APP_11033", GOODIX_PSK_ADDR,       FALSE },
+  { "GF3288_ST411SEC_APP_11034", GOODIX_PSK_ADDR_11034, TRUE },
+};
 
 struct _FpiDeviceGoodixTls
 {
@@ -113,6 +129,7 @@ struct _FpiDeviceGoodixTls
   GxTls        *tls;
   gboolean      tls_up;
   guint8        psk[GOODIX_PSK_LEN];
+  const GxFirmware *fw;       /* identified at open */
 
   /* One TLS record, consumed by the BIO recv callback or the image decoder. */
   guint8        tls_rx[GX_RX_MAX];
@@ -775,6 +792,36 @@ gx_gpio_reset (FpiDeviceGoodixTls *self)
 /*  TLS session                                                        */
 /* ------------------------------------------------------------------ */
 
+/* Reads the pre-shared key out of the sensor's RAM. Between attempts, either
+ * resets the sensor or, where a reset would undo the chip enable, only drops
+ * whatever a late reply left queued. self->psk is only ever replaced by a
+ * complete key. */
+static gboolean
+gx_read_psk (FpiDeviceGoodixTls *self, gboolean reset_between)
+{
+  guint8 key[GOODIX_PSK_LEN];
+  gboolean ok = FALSE;
+  int att;
+
+  for (att = 1; att <= GX_PSK_ATTEMPTS; att++)
+    {
+      if (gx_mem_read (self, self->fw->psk_addr, GOODIX_PSK_LEN, key) ==
+          GOODIX_PSK_LEN)
+        {
+          memcpy (self->psk, key, GOODIX_PSK_LEN);
+          ok = TRUE;
+          break;
+        }
+      fp_info ("PSK read attempt %d failed", att);
+      if (reset_between)
+        gx_gpio_reset (self);
+      else
+        gx_flush_rx (self);
+    }
+  explicit_bzero (key, sizeof key);
+  return ok;
+}
+
 /* Resets the sensor, clears any TLS state the MCU kept, uploads the
  * configuration blob (which opens the command gate), then enables the chip
  * and requests a TLS session. The sensor's ClientHello follows. */
@@ -797,6 +844,18 @@ gx_upload_config_and_reqtls (FpiDeviceGoodixTls *self)
   if (!gx_command (self, GX_ENABLE, sizeof GX_ENABLE, GX_NOP_GAP_US,
                    GX_ACK_TIMEOUT_MS, NULL))
     fp_dbg ("enable not acknowledged");
+
+  /* Where the key is only settled once the chip is enabled (11034), read it
+   * now: request-TLS below closes memory reads, and by this point the unlock
+   * above has dropped any session an earlier process left on the MCU. No
+   * reset between attempts, which would undo enable. Without the key, give
+   * this attempt up rather than run a handshake that is bound to fail. */
+  if (self->fw->psk_after_enable && !gx_read_psk (self, FALSE))
+    {
+      fp_warn ("cannot read the TLS key after enable");
+      return FALSE;
+    }
+
   if (!gx_command (self, GX_REQTLS, sizeof GX_REQTLS, GX_NOP_GAP_US,
                    GX_ACK_TIMEOUT_MS, NULL))
     {
@@ -2017,22 +2076,39 @@ gx_dev_verify (FpDevice *dev)
 /*  Open / close                                                       */
 /* ------------------------------------------------------------------ */
 
-/* Reads the pre-shared key out of the sensor's RAM, resetting between
- * attempts. */
-static gboolean
-gx_read_psk (FpiDeviceGoodixTls *self)
+/* Reads the firmware version, resetting between attempts, and looks it up in
+ * gx_firmwares. Returns NULL only when the version cannot be read at all. */
+static const GxFirmware *
+gx_identify_firmware (FpiDeviceGoodixTls *self)
 {
+  const GxFirmware *f;
+  gchar fw[64];
+  gsize i;
   int att;
 
-  for (att = 1; att <= GX_PSK_ATTEMPTS; att++)
+  for (att = 1; !gx_read_fw_version (self, fw, sizeof fw); att++)
     {
-      if (gx_mem_read (self, GOODIX_PSK_ADDR, GOODIX_PSK_LEN, self->psk) ==
-          GOODIX_PSK_LEN)
-        return TRUE;
-      fp_info ("PSK read attempt %d failed", att);
+      fp_info ("firmware version read attempt %d failed", att);
+      if (att == GX_FW_ATTEMPTS)
+        return NULL;
       gx_gpio_reset (self);
     }
-  return FALSE;
+
+  for (i = 0; i < G_N_ELEMENTS (gx_firmwares); i++)
+    {
+      f = &gx_firmwares[i];
+      if (g_str_equal (fw, f->version))
+        {
+          fp_info ("GXFP5187 firmware: %s (key at 0x%08x, read %s enable)",
+                   fw, f->psk_addr, f->psk_after_enable ? "after" : "before");
+          return f;
+        }
+    }
+  f = &gx_firmwares[0];
+  fp_warn ("unknown GXFP5187 firmware %s; trying the key layout of %s "
+           "(0x%08x). If the TLS handshake fails, this firmware needs support.",
+           fw, f->version, f->psk_addr);
+  return f;
 }
 
 static void
@@ -2070,7 +2146,6 @@ gx_open_thread (GTask *task, gpointer src, gpointer data, GCancellable *c)
 {
   GxWork *w = data;
   FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS (w->dev);
-  gchar fw[64];
 
   /* Drop stores whose fprintd template was deleted meanwhile. */
   gx_adapt_sweep ();
@@ -2092,9 +2167,20 @@ gx_open_thread (GTask *task, gpointer src, gpointer data, GCancellable *c)
     }
 
   gx_gpio_reset (self);
-  if (gx_read_fw_version (self, fw, sizeof fw))
-    fp_info ("GXFP5187 firmware: %s", fw);
-  w->ok = gx_read_psk (self);
+  self->fw = gx_identify_firmware (self);
+  if (!self->fw)
+    {
+      w->error = fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+        "cannot read the sensor's firmware version; if this persists the "
+        "sensor needs a full power-off (charger unplugged)");
+      g_task_return_boolean (task, TRUE);
+      return;
+    }
+  /* A key only settled after enable is read there instead, once the MCU's TLS
+   * state has been unlocked (gx_upload_config_and_reqtls): a value read here
+   * would be thrown away, and a session that an earlier process left on the
+   * MCU can keep memory reads closed until that unlock. */
+  w->ok = self->fw->psk_after_enable || gx_read_psk (self, TRUE);
   if (!w->ok)
     w->error = fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
       "cannot read the sensor's TLS key; if this persists the sensor needs "
